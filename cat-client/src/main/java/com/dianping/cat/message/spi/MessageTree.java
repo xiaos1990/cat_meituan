@@ -18,98 +18,91 @@
  */
 package com.dianping.cat.message.spi;
 
-import java.util.List;
-
+import com.dianping.cat.message.*;
+import com.dianping.cat.message.internal.MessageId;
 import io.netty.buffer.ByteBuf;
 
-import com.dianping.cat.message.Event;
-import com.dianping.cat.message.Heartbeat;
-import com.dianping.cat.message.Message;
-import com.dianping.cat.message.Metric;
-import com.dianping.cat.message.Transaction;
-import com.dianping.cat.message.internal.MessageId;
+import java.util.List;
 
 public interface MessageTree extends Cloneable {
-	public boolean canDiscard();
+    void addForkableTransaction(ForkableTransaction forkableTransaction);
 
-	public MessageTree copy();
+    boolean canDiscard();
 
-	public List<Event> findOrCreateEvents();
+    MessageTree copy();
 
-	public List<Heartbeat> findOrCreateHeartbeats();
+    List<Event> findOrCreateEvents();
 
-	public List<Metric> findOrCreateMetrics();
+    List<Heartbeat> findOrCreateHeartbeats();
 
-	public List<Transaction> findOrCreateTransactions();
+    List<Metric> findOrCreateMetrics();
 
-	public ByteBuf getBuffer();
+    List<Transaction> findOrCreateTransactions();
 
-	public String getDomain();
+    ByteBuf getBuffer();
 
-	public void setDomain(String domain);
+    String getDomain();
 
-	public List<Event> getEvents();
+    List<Event> getEvents();
 
-	public MessageId getFormatMessageId();
+    List<ForkableTransaction> getForkableTransactions();
 
-	public void setFormatMessageId(MessageId messageId);
+    MessageId getFormatMessageId();
 
-	public List<Heartbeat> getHeartbeats();
+    List<Heartbeat> getHeartbeats();
 
-	public String getHostName();
+    String getHostName();
 
-	public void setHostName(String hostName);
+    String getIpAddress();
 
-	public String getIpAddress();
+    Message getMessage();
 
-	public void setIpAddress(String ipAddress);
+    String getMessageId();
 
-	public String getSessionToken();
+    List<Metric> getMetrics();
 
-	public void setSessionToken(String session);
+    String getParentMessageId();
 
-	public Message getMessage();
+    String getRootMessageId();
 
-	public void setMessage(Message message);
+    String getSessionToken();
 
-	public String getMessageId();
+    String getThreadGroupName();
 
-	public void setMessageId(String messageId);
+    String getThreadId();
 
-	public List<Metric> getMetrics();
+    String getThreadName();
 
-	public String getParentMessageId();
+    List<Transaction> getTransactions();
 
-	public void setParentMessageId(String parentMessageId);
+    boolean isHitSample();
 
-	public String getRootMessageId();
+    void setDiscardPrivate(boolean discard);
 
-	public void setRootMessageId(String rootMessageId);
+    void setDomain(String domain);
 
-	public String getThreadGroupName();
+    void setFormatMessageId(MessageId messageId);
 
-	public void setThreadGroupName(String name);
+    void setHitSample(boolean hitSample);
 
-	public String getThreadId();
+    void setHostName(String hostName);
 
-	public void setThreadId(String threadId);
+    void setIpAddress(String ipAddress);
 
-	public String getThreadName();
+    void setMessage(Message message);
 
-	public void setThreadName(String id);
+    void setMessageId(String messageId);
 
-	public List<Transaction> getTransactions();
+    void setParentMessageId(String parentMessageId);
 
-	public boolean isProcessLoss();
+    void setRootMessageId(String rootMessageId);
 
-	public void setProcessLoss(boolean loss);
+    void setSessionToken(String session);
 
-	public void setDiscard(boolean discard);
+    void setThreadGroupName(String name);
 
-	public boolean isHitSample();
+    void setThreadId(String threadId);
 
-	public void setHitSample(boolean hitSample);
-
-	public void setDiscardPrivate(boolean discard);
+    void setThreadName(String id);
 
 }

@@ -18,297 +18,349 @@
  */
 package com.dianping.cat.message.io;
 
-import java.net.InetSocketAddress;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.atomic.AtomicInteger;
-
-import io.netty.buffer.ByteBuf;
-import io.netty.channel.ChannelFuture;
-import org.codehaus.plexus.logging.LogEnabled;
-import org.codehaus.plexus.logging.Logger;
-import org.unidal.helper.Threads;
-import org.unidal.helper.Threads.Task;
-import org.unidal.lookup.annotation.Inject;
-import org.unidal.lookup.annotation.Named;
-
-import com.dianping.cat.ApplicationSettings;
 import com.dianping.cat.analyzer.LocalAggregator;
-import com.dianping.cat.configuration.ClientConfigManager;
+import com.dianping.cat.configuration.ClientConfigService;
+import com.dianping.cat.configuration.DefaultClientConfigService;
+import com.dianping.cat.configuration.MessageType;
+import com.dianping.cat.configuration.client.entity.Server;
+import com.dianping.cat.log.CatLogger;
+import com.dianping.cat.message.Message;
 import com.dianping.cat.message.Transaction;
 import com.dianping.cat.message.internal.DefaultTransaction;
 import com.dianping.cat.message.internal.MessageIdFactory;
+import com.dianping.cat.message.queue.DefaultMessageQueue;
+import com.dianping.cat.message.queue.PriorityMessageQueue;
 import com.dianping.cat.message.spi.MessageCodec;
 import com.dianping.cat.message.spi.MessageQueue;
 import com.dianping.cat.message.spi.MessageStatistics;
 import com.dianping.cat.message.spi.MessageTree;
 import com.dianping.cat.message.spi.codec.NativeMessageCodec;
-import com.dianping.cat.message.spi.internal.DefaultMessageTree;
-import com.dianping.cat.status.StatusExtension;
+import com.dianping.cat.message.spi.codec.PlainTextMessageCodec;
+import com.dianping.cat.message.spi.internal.DefaultMessageStatistics;
+import com.dianping.cat.status.AbstractCollector;
 import com.dianping.cat.status.StatusExtensionRegister;
+import com.dianping.cat.util.Threads;
+import io.netty.buffer.ByteBuf;
+import io.netty.channel.ChannelFuture;
 
-@Named
-public class TcpSocketSender implements Task, MessageSender, LogEnabled {
+import java.net.InetSocketAddress;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
 
-	public static final int SIZE = ApplicationSettings.getQueueSize();
+public class TcpSocketSender implements Threads.Task, MessageSender {
+    private MessageCodec nativeCodec = new NativeMessageCodec();
+    private MessageStatistics statistics = new DefaultMessageStatistics();
+    private ClientConfigService configService = DefaultClientConfigService.getInstance();
+    private MessageQueue messageQueue = new PriorityMessageQueue(SIZE);
+    private MessageIdFactory factory = MessageIdFactory.getInstance();
+    private AtomicMessageManager atomicQueueManager = new AtomicMessageManager(SIZE);
+    private ChannelManager channelManager = ChannelManager.getInstance();
 
-	private static final int MAX_CHILD_NUMBER = 200;
+    private boolean active;
+    private static final int SIZE = 5000;
+    private static final long HOUR = 1000 * 60 * 60L;
+    private static CatLogger LOGGER = CatLogger.getInstance();
+    private static TcpSocketSender INSTANCE = new TcpSocketSender();
 
-	private static final int MAX_DURATION = 1000 * 30;
+    public static TcpSocketSender getInstance() {
+        return INSTANCE;
+    }
 
-	private static final long HOUR = 1000 * 60 * 60L;
+    private TcpSocketSender() {
+        List<Server> servers = configService.getServers();
+        List<InetSocketAddress> addresses = new ArrayList<InetSocketAddress>();
 
-	private MessageCodec m_codec = new NativeMessageCodec();
+        for (Server server : servers) {
+            if (server.isEnabled()) {
+                addresses.add(new InetSocketAddress(server.getIp(), server.getPort()));
+            }
+        }
 
-	@Inject
-	private MessageStatistics m_statistics;
+        initialize(addresses);
+    }
 
-	@Inject
-	private ClientConfigManager m_configManager;
+    @Override
+    public String getName() {
+        return "netty-tcp-data-sender";
+    }
 
-	@Inject
-	private MessageIdFactory m_factory;
+    public void initialize(List<InetSocketAddress> addresses) {
+        Threads.forGroup("cat").start(channelManager);
 
-	private MessageQueue m_queue = new DefaultMessageQueue(SIZE);
+        Runtime.getRuntime().addShutdownHook(new Thread() {
+            @Override
+            public void run() {
+                LOGGER.info("shut down cat client in runtime shut down hook!");
+                shutdown();
+            }
+        });
 
-	private MessageQueue m_atomicQueue = new DefaultMessageQueue(SIZE);
+        StatusExtensionRegister.getInstance().register(new AbstractCollector() {
 
-	private ChannelManager m_channelManager;
+            @Override
+            public String getId() {
+                return "cat.status";
+            }
 
-	private Logger m_logger;
+            @Override
+            public Map<String, String> getProperties() {
+                Map<String, String> map = new LinkedHashMap<String, String>();
 
-	private boolean m_active;
+                map.put("cat.status.send.sample.ratio", String.valueOf(configService.getSamplingRate() * 100));
+                map.put("cat.status.send.queue.size", String.valueOf(messageQueue.size()));
+                map.put("cat.status.send.atomic.queue.size", String.valueOf(atomicQueueManager.getQueueSize()));
 
-	private AtomicInteger m_errors = new AtomicInteger();
+                Map<String, Long> values = statistics.getStatistics();
 
-	private AtomicInteger m_sampleCount = new AtomicInteger();
+                for (Entry<String, Long> entry : values.entrySet()) {
+                    map.put(entry.getKey(), String.valueOf(entry.getValue()));
+                }
 
-	@Override
-	public void enableLogging(Logger logger) {
-		m_logger = logger;
-	}
+                return map;
+            }
+        });
+    }
 
-	@Override
-	public String getName() {
-		return "TcpSocketSender";
-	}
+    private void logMessageDiscard(MessageTree tree) {
+        statistics.onOverflowed(tree);
+    }
 
-	@Override
-	public void initialize(List<InetSocketAddress> addresses) {
-		m_channelManager = new ChannelManager(m_logger, addresses, m_configManager, m_factory);
+    private void offer(MessageTree tree) {
+        MessageType type = configService.parseMessageType(tree);
+        boolean result = true;
 
-		Threads.forGroup("cat").start(this);
-		Threads.forGroup("cat").start(m_channelManager);
+        switch (type) {
+            case NORMAL_MESSAGE:
+                result = messageQueue.offer(tree);
+                break;
+            case SMALL_TRANSACTION:
+                result = atomicQueueManager.offerToQueue(tree);
+                break;
+            case STAND_ALONE_EVENT:
+                processTreeInClient(tree);
+                break;
+        }
 
-		Runtime.getRuntime().addShutdownHook(new Thread() {
-			@Override
-			public void run() {
-				m_logger.info("shut down cat client in runtime shut down hook!");
-				shutdown();
-			}
-		});
+        if (!result) {
+            processTreeInClient(tree);
 
-		StatusExtensionRegister.getInstance().register(new StatusExtension() {
+            if (!tree.canDiscard()) {
+                logMessageDiscard(tree);
+            }
+        }
+    }
 
-			@Override
-			public String getDescription() {
-				return "client-send-queue";
-			}
+    private void processMessage() {
+        ChannelFuture channel = channelManager.channel();
 
-			@Override
-			public String getId() {
-				return "client-send-queue";
-			}
+        if (channel != null) {
+            MessageTree tree = null;
 
-			@Override
-			public Map<String, String> getProperties() {
-				Map<String, String> map = new HashMap<String, String>();
+            try {
+                tree = messageQueue.poll();
 
-				map.put("msg-queue", String.valueOf(m_queue.size()));
-				map.put("atomic-queue", String.valueOf(m_queue.size()));
-				return map;
-			}
-		});
-	}
+                if (tree != null) {
+                    sendInternal(channel, tree);
+                    tree.setMessage(null);
+                } else {
+                    try {
+                        Thread.sleep(5);
+                    } catch (Exception e) {
+                        active = false;
+                    }
+                }
+            } catch (Throwable t) {
+                LOGGER.error(PlainTextMessageCodec.encodeTree(tree));
+                LOGGER.error("Error when sending message over TCP socket!", t);
+            }
+        } else {
+            long current = System.currentTimeMillis();
+            long oldTimestamp = current - HOUR;
 
-	private void logQueueFullInfo(MessageTree tree) {
-		if (m_statistics != null) {
-			m_statistics.onOverflowed(tree);
-		}
+            while (true) {
+                try {
+                    MessageTree tree = messageQueue.peek();
 
-		int count = m_errors.incrementAndGet();
+                    if (tree != null && tree.getMessage().getTimestamp() < oldTimestamp) {
+                        MessageTree discardTree = messageQueue.poll();
 
-		if (count % 1000 == 0 || count == 1) {
-			m_logger.error("Message queue is full in tcp socket sender! Count: " + count);
-		}
+                        if (discardTree != null) {
+                            statistics.onOverflowed(discardTree);
+                        }
+                    } else {
+                        break;
+                    }
+                } catch (Exception e) {
+                    LOGGER.error(e.getMessage(), e);
+                    break;
+                }
+            }
 
-		tree = null;
-	}
+            try {
+                Thread.sleep(5);
+            } catch (Exception e) {
+                active = false;
+            }
+        }
+    }
 
-	private MessageTree mergeTree(MessageQueue handler) {
-		int max = MAX_CHILD_NUMBER;
-		DefaultTransaction tran = new DefaultTransaction("System", "_CatMergeTree", null);
-		MessageTree first = handler.poll();
+    private void processTreeInClient(MessageTree tree) {
+        LocalAggregator.aggregate(tree);
+    }
 
-		tran.setStatus(Transaction.SUCCESS);
-		tran.setCompleted(true);
-		tran.setDurationInMicros(0);
-		tran.addChild(first.getMessage());
+    @Override
+    public void run() {
+        active = true;
 
-		while (max >= 0) {
-			MessageTree tree = handler.poll();
+        while (active) {
+            processMessage();
+            atomicQueueManager.processAtomicMessage();
+        }
 
-			if (tree == null) {
-				break;
-			}
-			tran.addChild(tree.getMessage());
-			max--;
-		}
-		((DefaultMessageTree) first).setMessage(tran);
-		return first;
-	}
+        atomicQueueManager.processAtomicMessage();
 
-	private void offer(MessageTree tree) {
-		if (m_configManager.isAtomicMessage(tree)) {
-			boolean result = m_atomicQueue.offer(tree);
+        while (true) {
+            MessageTree tree = messageQueue.poll();
 
-			if (!result) {
-				logQueueFullInfo(tree);
-			}
-		} else {
-			boolean result = m_queue.offer(tree);
+            if (tree != null) {
+                ChannelFuture channel = channelManager.channel();
 
-			if (!result) {
-				logQueueFullInfo(tree);
-			}
-		}
-	}
+                if (channel != null) {
+                    sendInternal(channel, tree);
+                } else {
+                    offer(tree);
+                }
+            } else {
+                break;
+            }
+        }
+    }
 
-	private void processAtomicMessage() {
-		while (true) {
-			if (shouldMerge(m_atomicQueue)) {
-				MessageTree tree = mergeTree(m_atomicQueue);
-				boolean result = m_queue.offer(tree);
+    @Override
+    public void send(MessageTree tree) {
+        if (!configService.isMessageBlock()) {
+            double sampleRatio = configService.getSamplingRate();
 
-				if (!result) {
-					logQueueFullInfo(tree);
-				}
-			} else {
-				break;
-			}
-		}
-	}
+            if (tree.canDiscard() && sampleRatio < 1.0 && (!tree.isHitSample())) {
+                processTreeInClient(tree);
+            } else {
+                offer(tree);
+            }
+        }
+    }
 
-	private void processNormalMessage() {
-		while (true) {
-			ChannelFuture channel = m_channelManager.channel();
+    private void sendInternal(ChannelFuture channel, MessageTree tree) {
+        if (tree.getMessageId() == null) {
+            tree.setMessageId(factory.getNextId());
+        }
 
-			if (channel != null) {
-				try {
-					MessageTree tree = m_queue.poll();
+        ByteBuf buf = nativeCodec.encode(tree);
+        int size = buf.readableBytes();
 
-					if (tree != null) {
-						sendInternal(channel, tree);
-						tree.setMessage(null);
-					} else {
-						try {
-							Thread.sleep(5);
-						} catch (Exception e) {
-							m_active = false;
-						}
-						break;
-					}
-				} catch (Throwable t) {
-					m_logger.error("Error when sending message over TCP socket!", t);
-				}
-			} else {
-				try {
-					Thread.sleep(5);
-				} catch (Exception e) {
-					m_active = false;
-				}
-			}
-		}
-	}
+        channel.channel().writeAndFlush(buf);
 
-	@Override
-	public void run() {
-		m_active = true;
+        if (statistics != null) {
+            statistics.onBytes(size);
+        }
+    }
 
-		while (m_active) {
-			processAtomicMessage();
-			processNormalMessage();
-		}
+    @Override
+    public void shutdown() {
+        active = false;
+        channelManager.shutdown();
+    }
 
-		processAtomicMessage();
+    public class AtomicMessageManager {
+        private MessageQueue smallMessages;
+        private static final long HOUR = 1000 * 60 * 60L;
+        private static final int MAX_CHILD_NUMBER = 200;
+        private static final int MAX_DURATION = 1000 * 30;
 
-		while (true) {
-			MessageTree tree = m_queue.poll();
+        public AtomicMessageManager(int size) {
+            smallMessages = new DefaultMessageQueue(size);
+        }
 
-			if (tree != null) {
-				ChannelFuture channel = m_channelManager.channel();
+        public int getQueueSize() {
+            return smallMessages.size();
+        }
 
-				if (channel != null) {
-					sendInternal(channel, tree);
-				} else {
-					offer(tree);
-				}
-			} else {
-				break;
-			}
-		}
-	}
+        private boolean isSameHour(long time1, long time2) {
+            int hour1 = (int) (time1 / HOUR);
+            int hour2 = (int) (time2 / HOUR);
 
-	@Override
-	public void send(MessageTree tree) {
-		if (!m_configManager.isBlock()) {
-			double sampleRatio = m_configManager.getSampleRatio();
+            return hour1 == hour2;
+        }
 
-			if (tree.canDiscard() && sampleRatio < 1.0 && (!tree.isHitSample())) {
-				processTreeInClient(tree);
-			} else {
-				offer(tree);
-			}
-		}
-	}
+        private MessageTree mergeTree(MessageQueue queue) {
+            int max = MAX_CHILD_NUMBER;
+            DefaultTransaction t = new DefaultTransaction("System", "AtomicAggregator");
+            MessageTree first = queue.poll();
+            final Message message = first.getMessage();
+            final long timestamp = message.getTimestamp();
 
-	private void processTreeInClient(MessageTree tree) {
-		LocalAggregator.aggregate(tree);
-	}
+            t.setStatus(Transaction.SUCCESS);
+            t.setCompleted(true);
+            t.setDurationStart(timestamp);
+            t.setTimestamp(timestamp);
+            t.setDurationInMicros(0);
+            t.addChild(message);
 
-	public void sendInternal(ChannelFuture channel, MessageTree tree) {
-		if (tree.getMessageId() == null) {
-			tree.setMessageId(m_factory.getNextId());
-		}
+            while (max >= 0) {
+                MessageTree tree = queue.peek();
 
-		ByteBuf buf = m_codec.encode(tree);
+                if (tree != null) {
+                    long nextTimestamp = tree.getMessage().getTimestamp();
 
-		int size = buf.readableBytes();
+                    if (isSameHour(timestamp, nextTimestamp)) {
+                        tree = queue.poll();
 
-		channel.channel().writeAndFlush(buf);
+                        if (tree == null) {
+                            break;
+                        }
+                        t.addChild(tree.getMessage());
+                        max--;
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            first.setMessage(t);
+            return first;
+        }
 
-		if (m_statistics != null) {
-			m_statistics.onBytes(size);
-		}
-	}
+        public boolean offerToQueue(MessageTree tree) {
+            return smallMessages.offer(tree);
+        }
 
-	private boolean shouldMerge(MessageQueue queue) {
-		MessageTree tree = queue.peek();
+        public void processAtomicMessage() {
+            processNormalAtomicMessage();
+        }
 
-		if (tree != null) {
-			long firstTime = tree.getMessage().getTimestamp();
+        void processNormalAtomicMessage() {
+            while (true) {
+                if (shouldMerge(smallMessages)) {
+                    MessageTree tree = mergeTree(smallMessages);
 
-			if (System.currentTimeMillis() - firstTime > MAX_DURATION || queue.size() >= MAX_CHILD_NUMBER) {
-				return true;
-			}
-		}
-		return false;
-	}
+                    offer(tree);
+                } else {
+                    break;
+                }
+            }
+        }
 
-	@Override
-	public void shutdown() {
-		m_active = false;
-		m_channelManager.shutdown();
-	}
+        private boolean shouldMerge(MessageQueue queue) {
+            MessageTree tree = queue.peek();
+
+            if (tree != null) {
+                long firstTime = tree.getMessage().getTimestamp();
+                return System.currentTimeMillis() - firstTime > MAX_DURATION || queue.size() >= MAX_CHILD_NUMBER;
+            }
+            return false;
+        }
+    }
 }
